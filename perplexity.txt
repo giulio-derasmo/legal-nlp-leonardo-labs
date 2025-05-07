@@ -1,0 +1,7 @@
+
+romanAI	20	1024	5.504
+llama8b	20	1024	4.270
+llama8b	20	1024	4.315
+romanAI	20	1024	5.751
+romanAI	20	1024	6.262
+llama8b	20	1024	3.792
