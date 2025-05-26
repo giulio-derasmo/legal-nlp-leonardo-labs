@@ -6,7 +6,22 @@ import builtins
 import logging
 import os
 
+# --- monkey-patch torch.load to disable weights_only safety --------------------
 import torch
+
+orig_torch_load = torch.load
+
+def torch_wrapper(*args, **kwargs):
+    logging.warning("[comfyui-unsafe-torch] I have unsafely patched `torch.load`.  The `weights_only` option of `torch.load` is forcibly disabled.")
+    kwargs['weights_only'] = False
+
+    return orig_torch_load(*args, **kwargs)
+
+torch.load = torch_wrapper
+
+NODE_CLASS_MAPPINGS = {}
+__all__ = ['NODE_CLASS_MAPPINGS']
+
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -18,6 +33,12 @@ from transformers import BitsAndBytesConfig
 import huggingface_hub
 from trl import SFTConfig
 from trl import SFTTrainer
+from functools import partial
+from transformers.trainer_utils import get_last_checkpoint
+#torch.serialization.add_safe_globals(['numpy._core.multiarray._reconstruct'])
+
+import transformers
+transformers.logging.set_verbosity_info()
 
 m2hf = {
     # velvet models
@@ -57,12 +78,15 @@ quant = {
 
 accelerator = Accelerator()
 
+original_print = builtins.print
+
 def print_only_main(*args, **kwargs):
     if accelerator.is_main_process:
         builtins.print(*args, **kwargs)
 
 
 builtins.print = print_only_main
+
 
 
 def setup_logging():
@@ -81,24 +105,31 @@ logger = setup_logging()
 #hf_login()
 
 
-
+def preprocess_function(example, tokenizer, max_length):
+    tokenized =  tokenizer(example["text"], truncation=True, padding="max_length", max_length=max_length)
+    #tokenized["labels"] = tokenized["input_ids"][:]
+    return tokenized
+    
+    
 def train():
     parser = argparse.ArgumentParser(description='Train with Accelerate + DeepSpeed')
-    parser.add_argument('--data_path', type=str, default='data')
+    parser.add_argument('--data_path', type=str, default='../data')
     parser.add_argument('--train_filename', type=str, default='train.csv')
     parser.add_argument('--model_name', type=str, default="llama3_8b", help="short model name")
     parser.add_argument('--quantization', type=str, default="None", choices=["None", "4bit", "8bit"])
     parser.add_argument('--log_path', type=str, default='./log')
     parser.add_argument('--version', type=str, default="0", help="version of the train")
     parser.add_argument('--wandb_project', type=str, default="legalita")
+    parser.add_argument('--max_length', type=int, default=1024)
     args = parser.parse_args()
-
+    
+    args.max_length = 512
     base_model_id = m2hf[args.model_name]
     bnb_config = quant[args.quantization]
     
     set_seed(42)
     if accelerator.is_main_process:
-      logger.info(f"{os.getcwd()}")
+      logger.info(f"Main path: {os.getcwd()}")
     
     if accelerator.is_main_process:
         logger.info(f"Running on: {accelerator.device}, distributed: {accelerator.distributed_type}")
@@ -107,19 +138,23 @@ def train():
 
     ########################################################
     # Load dataset
-    #######################################################        
+    #######################################################    
+    #args.train_filename = 'train_normattiva.json'    
     dataset_path = os.path.join(args.data_path, args.train_filename)
-      
     
     if accelerator.is_main_process:
-        logger.info(f"{dataset_path}")
-        
+        logger.info(f"{args.data_path}")
+        logger.info(f"{os.path.join(args.data_path, args.train_filename)}")
+      
     train_dataset = load_dataset('csv', data_files=dataset_path, split='train')
-    train_dataset = train_dataset.select(range(100))
+    #train_dataset = load_dataset('json', data_files=dataset_path)['train']
+    #train_dataset = train_dataset.select(range(100_000))
+    #train_dataset = train_dataset.select(range(100))
     
     if accelerator.is_main_process:
         logger.info(f"{train_dataset}")
-
+    
+    
     ########################################################
     # Load model & tokenizer
     ########################################################
@@ -147,11 +182,13 @@ def train():
 
     if accelerator.is_main_process:
         logger.info(f"Tokenize the texts...")
-    def preprocess_function(example):
-        return tokenizer(example["clean_text"], truncation=True, max_length=2048, padding="max_length")
-
-    train_dataset = train_dataset.map(preprocess_function, batched=True)
     
+    preprocess = partial(preprocess_function, tokenizer=tokenizer, max_length=args.max_length)
+    train_dataset = train_dataset.map(preprocess, batched=True)
+
+    if accelerator.is_main_process:
+        logger.info(f"{train_dataset}")
+        
     ########################################################
     # PEFT config (LoRA)
     ########################################################
@@ -168,39 +205,39 @@ def train():
     # Training arguments
     ########################################################
     output_dir = os.path.join(args.log_path, f"legalita-{args.model_name}-{args.version}")
-
+    
+    last_checkpoint = None
+    if os.path.isdir(output_dir):
+        last_checkpoint = get_last_checkpoint(output_dir)
+    
+    
+    if accelerator.is_main_process:
+        logger.info(f"{last_checkpoint}")
+        
     training_arguments = SFTConfig(
         output_dir=output_dir,
-
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=8,
-
-        warmup_ratio=0.1,
-        num_train_epochs=1,
-
-        learning_rate=4.5e-4,  # Want a small lr for finetuning
-        bf16=True,
-        optim="adamw_8bit",
-        weight_decay=0.1,
-        lr_scheduler_type="cosine",
+        #label_names=["labels"],
+        dataset_text_field="text",
         seed=3407,
-
-        max_seq_length=2048,
-
-        # max_grad_norm=max_grad_norm= 0.3
-        dataset_text_field="clean_text",
-
-        packing=False,
-
-        logging_steps=100,
-        logging_dir=os.path.join(output_dir, "logs"),  # Directory for storing logs
-        
-        save_steps=1500, 
-        save_strategy="steps",  # Save the model checkpoint every logging step
-
+        learning_rate=4.5e-4,
+        warmup_ratio=0.1,
+        lr_scheduler_type='cosine',
+        bf16=True,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        num_train_epochs=1,
+        weight_decay=0.01,
+        optim="adamw_8bit",
+        max_seq_length=args.max_length,
+        packing=False,        
+        save_strategy="steps", 
+        save_steps=3500, 
         report_to=["wandb"],
+        logging_steps=500,
+        logging_dir=os.path.join(output_dir, "logs"), 
+        push_to_hub=False,
     )
-
+   
     ########################################################
     # Trainer
     ########################################################
@@ -214,14 +251,16 @@ def train():
         peft_config=peft_config,
         processing_class=tokenizer,
         args=training_arguments,
+        
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=False)
   
-    
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         logger.info("Saving model...")
-        new_model = f"RomanAI_base_{args.model_name}"
-        trainer.model.save_pretrained(os.path.join(args.data_path, 'log/model', new_model))
+        new_model = f"Romanai_512_{args.model_name}"
+        trainer.model.save_pretrained(os.path.join(args.data_path, 'log/model', new_model), 
+                                      save_embeddings=False)
         wandb.finish()
 
 

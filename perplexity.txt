@@ -1,7 +1,16 @@
 
-romanAI	20	1024	5.504
-llama8b	20	1024	4.270
-llama8b	20	1024	4.315
-romanAI	20	1024	5.751
-romanAI	20	1024	6.262
-llama8b	20	1024	3.792
+llama8b	20	1024	3.904
+romanLLama	20	1024	6.653
+romanLLama_adapter	20	1024	6.653
+romanLLama	20	1024	13.290
+romanLLama	8.956
+romanLLama_adapter	8.957
+romanLLama	8.956
+llama8b	3.948
+100klegal	2.634
+100klegal	2.634
+llama8b	4.804
+romanLLama_adapter	13.105
+romanLLama	13.105
+romanLLama512	8.956
+100klegal	3.902

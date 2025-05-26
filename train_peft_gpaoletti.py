@@ -9,7 +9,6 @@ import os
 import torch
 import wandb
 from accelerate import Accelerator
-from accelerate.utils import set_seed
 from datasets import load_dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM
@@ -84,7 +83,7 @@ logger = setup_logging()
 
 def train():
     parser = argparse.ArgumentParser(description='Train with Accelerate + DeepSpeed')
-    parser.add_argument('--data_path', type=str, default='data')
+    parser.add_argument('--data_path', type=str, default='./data')
     parser.add_argument('--train_filename', type=str, default='train.csv')
     parser.add_argument('--model_name', type=str, default="llama3_8b", help="short model name")
     parser.add_argument('--quantization', type=str, default="None", choices=["None", "4bit", "8bit"])
@@ -95,11 +94,7 @@ def train():
 
     base_model_id = m2hf[args.model_name]
     bnb_config = quant[args.quantization]
-    
-    set_seed(42)
-    if accelerator.is_main_process:
-      logger.info(f"{os.getcwd()}")
-    
+
     if accelerator.is_main_process:
         logger.info(f"Running on: {accelerator.device}, distributed: {accelerator.distributed_type}")
         wandb.login(key='f37bda8ff53fbbb25723f6b1a35146b2ac6825fa')
@@ -107,13 +102,10 @@ def train():
 
     ########################################################
     # Load dataset
-    #######################################################        
+    ########################################################
     dataset_path = os.path.join(args.data_path, args.train_filename)
-      
-    
     if accelerator.is_main_process:
         logger.info(f"{dataset_path}")
-        
     train_dataset = load_dataset('csv', data_files=dataset_path, split='train')
     train_dataset = train_dataset.select(range(100))
     
@@ -216,7 +208,6 @@ def train():
         args=training_arguments,
     )
     trainer.train()
-  
     
     if accelerator.is_main_process:
         logger.info("Saving model...")

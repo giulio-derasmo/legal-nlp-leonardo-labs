@@ -14,14 +14,14 @@ import os
 # Log in using your token
 login("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")
 
-m2hf = {'base_model': {
+m2hf = {'base_model': {  
                          'llama8b': "meta-llama/Meta-Llama-3-8B", 
                          'romanLLama': 'giulioderasmo/RomanLLama',
+                         '100klegal': 'giulioderasmo/test_100k_legalai',
+                         'romanLLama512': 'giulioderasmo/RomanLLama',
                        },
         'adapter': { 'romanLLama_adapter': 'giulioderasmo/RomanLLama-adapter', }
      } 
-
-
 
 quant = {
     "None": None,
@@ -61,40 +61,34 @@ def load_model_and_tokenizer(args):
     if args.is_adapter:
         print('load adapter')
         model = PeftModel.from_pretrained(model, adapter_id, device_map="auto")
-      
+    
+    model.eval()
     return model, tokenizer
 
 
-def calculate_perplexity(model, tokenizer, test_dataset, prompt_length=20, max_seq_length=1024):
-    model.eval()
-
-    nlls = []
-    # Process each sample individually instead of concatenating
-    for i, sample in enumerate(tqdm(test_dataset["text"])):
-        # Tokenize sample and truncate to max_seq_length
-        encoding = tokenizer(sample, return_tensors="pt", truncation=True, max_length=max_seq_length)
-        input_ids = encoding.input_ids.to(model.device)
-
-        # Skip samples that are too short
-        if input_ids.size(1) <= prompt_length + 1:  # Need at least one token to predict
-            continue
-
-        # Split into prompt and target
-        prompt_ids = input_ids[:, :prompt_length]
-        target_ids = input_ids.clone()
-        # Set tokens in the prompt section to -100 (ignore in loss calculation)
-        target_ids[:, :prompt_length] = -100
-
-        with torch.no_grad():
-            outputs = model(input_ids, labels=target_ids)
-            neg_log_likelihood = outputs.loss
-
-        # Accumulate loss * number of valid tokens
-        nlls.append(neg_log_likelihood)
-
-    ppl = torch.exp(torch.stack(nlls).mean())
-
-    return ppl
+def ppl_model(model, tokenizer, dataset):
+  nlls= []
+  max_length = 1024
+  stride = 512
+  for s in tqdm(range(len(dataset['text']))):
+      encodings = tokenizer(dataset['text'][s], return_tensors="pt")
+      seq_len = encodings.input_ids.size(1)
+      prev_end_loc = 0
+      for begin_loc in range(0, seq_len, stride):
+          end_loc = min(begin_loc + max_length, seq_len)
+          trg_len = end_loc - prev_end_loc
+          input_ids = encodings.input_ids[:, begin_loc:end_loc].to("cuda")
+          target_ids = input_ids.clone()
+          target_ids[:, :-trg_len] = -100
+          with torch.no_grad():
+              outputs = model(input_ids, labels=target_ids)
+              neg_log_likelihood = outputs.loss
+          nlls.append(neg_log_likelihood)
+          prev_end_loc = end_loc
+          if end_loc == seq_len:
+              break
+  ppl = torch.exp(torch.stack(nlls).mean())
+  return ppl
 
 
 if __name__ == "__main__":
@@ -102,27 +96,38 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Compute perplexity for a dataset using a language model.")
     parser.add_argument("--dataset_name", type=str, help="Name of the dataset to use.", default='./data/test.csv')
-    parser.add_argument("--model_name", type=str, required=True, help="Name of the model to use.")
-    parser.add_argument("--is_adapter", type=int, default=0, choices=[0, 1])
+    #parser.add_argument("--model_name", type=str, required=True, help="Name of the model to use.")
+    #parser.add_argument("--is_adapter", type=int, default=0, choices=[0, 1])
     parser.add_argument('--quantization', type=str, default="None", choices=["None", "4bit", "8bit"])
     args = parser.parse_args()
     
     args.prompt_length = 20
-    args.max_seq_length = 1024
+    args.max_seq_length = 512
     
-    print(args)
+    for model_name, is_adapter in zip(['romanLLama512', '100klegal', 'llama8b', 'romanLLama_adapter', 'romanLLama', ], [0, 0, 0, 1, 0]):
+        args.model_name = model_name
+        args.is_adapter = is_adapter
+        print(args)
+        
+        print('load dataset')
+        test_ds = pd.read_csv(args.dataset_name)
+        print('test_ds pre split', test_ds)
+        #_, test_ds = train_test_split(test_ds, test_size=1500, random_state=42, stratify=test_ds['label'])
+        
+        print('test_ds', test_ds)
+        
+        #args.train_filename = 'train_normattiva.json'    
+        #dataset_path = os.path.join('./data', args.train_filename)
+        #train_dataset = load_dataset('json', data_files=dataset_path)['train']
+        #test_ds = train_dataset.select(range(100_000, 101_000))
     
-    print('load dataset')
-    test_ds = pd.read_csv(args.dataset_name)
-    #_, test_ds = train_test_split(test_ds, test_size=1500, random_state=42, stratify=test_ds['label'])
-
-    print('load model and tokenizer')
-    model, tokenizer = load_model_and_tokenizer(args)
-
-    print('compute perplexity')
-    PPL = calculate_perplexity(model, tokenizer, test_ds, prompt_length=args.prompt_length, max_seq_length=args.max_seq_length)
-
-    print(f'PPL for the {args.model_name} is {PPL:.3f}')
+        print('load model and tokenizer')
+        model, tokenizer = load_model_and_tokenizer(args)
     
-    with open('./perplexity.txt', 'a') as file:
-        file.write(f"\n{args.model_name}\t{args.prompt_length}\t{args.max_seq_length}\t{PPL:.3f}") 
+        print('compute perplexity')
+        PPL = ppl_model(model, tokenizer, test_ds)
+    
+        print(f'PPL for the {args.model_name} is {PPL:.3f}')
+        
+        with open('./perplexity.txt', 'a') as file:
+            file.write(f"\n{args.model_name}\t{PPL:.3f}") 
